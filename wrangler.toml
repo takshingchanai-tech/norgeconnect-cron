@@ -1,0 +1,26 @@
+name = "norgeconnect-cron"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding       = "DB"
+database_name = "norgeconnect-db"
+database_id   = "b73ee3b6-6710-452b-a803-f794833a042f"
+
+[vars]
+STRIPE_PRICE_ID    = "price_YOUR_METERED_PRICE_ID"  # from Stripe dashboard
+PAYMENT_LINK_URL   = "https://buy.stripe.com/YOUR_PAYMENT_LINK"
+SYSTEM_FROM_EMAIL  = "hello@norgeconnect.no"
+
+# Secrets — set with: wrangler secret put SECRET_NAME
+# STRIPE_SECRET_KEY
+# RESEND_API_KEY
+# GMAIL_CLIENT_ID
+# GMAIL_CLIENT_SECRET
+# OUTLOOK_CLIENT_ID
+# OUTLOOK_CLIENT_SECRET
+
+# Runs every day at 07:00 UTC (09:00 Oslo / CET)
+[triggers]
+crons = ["0 7 * * *"]
