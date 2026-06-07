@@ -578,6 +578,19 @@ async function runTrialManagement(env: Env, today: string): Promise<void> {
 
 const API_BASE = 'https://norgeconnect-api.takshingchanai.workers.dev';
 
+async function createDashboardToken(env: Env, clientId: string): Promise<string> {
+  try {
+    const token = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    await env.DB.prepare(
+      'INSERT INTO login_tokens (token, client_id, expires_at, used) VALUES (?, ?, ?, 0)'
+    ).bind(token, clientId, expiresAt).run();
+    return `${API_BASE}/api/login/verify?token=${token}`;
+  } catch {
+    return `${env.SITE_URL}/dashboard?id=${clientId}`;
+  }
+}
+
 function parseLogos(raw: string | null): string[] {
   if (!raw) return [];
   if (raw.startsWith('[')) {
@@ -864,7 +877,7 @@ async function sendPaymentReminder(
   const isEn = client.language === 'en';
   const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   const name = esc(client.sig_name ?? client.company);
-  const dashboardUrl = `${env.SITE_URL}/dashboard?id=${client.id}`;
+  const dashboardUrl = await createDashboardToken(env, client.id);
 
   const subject = when === 'tomorrow'
     ? (isEn ? 'Your NorwayContact trial expires tomorrow'                            : 'Din NorwayContact prøveperiode utløper i morgen')
@@ -993,7 +1006,8 @@ async function sendReportForClient(env: Env, client: Client, today: string): Pro
     ? (isEn ? `NorwayContact — Weekly report` : `NorwayContact — Ukentlig rapport`)
     : (isEn ? `NorwayContact — Daily report, ${today}` : `NorwayContact — Daglig rapport, ${today}`);
 
-  const html = buildReportHtml(client, rows, isWeekly, today, env);
+  const dashboardUrl = await createDashboardToken(env, client.id);
+  const html = buildReportHtml(client, rows, isWeekly, today, dashboardUrl);
   const text = rows.map((r, i) =>
     `${i + 1}. ${r.target_company}  |  ${r.target_owner ?? '—'}  |  ${r.target_location ?? '—'}  |  ${r.target_email}${r.target_homepage ? '  |  ' + r.target_homepage : ''}`
   ).join('\n');
@@ -1029,12 +1043,11 @@ function buildReportHtml(
   rows: Array<{ target_company: string; target_owner: string | null; target_location: string | null; target_email: string; target_homepage: string | null; target_industry: string | null }>,
   isWeekly: boolean,
   today: string,
-  env: Env
+  dashboardUrl: string
 ): string {
   const isEn = client.language === 'en';
   const count = rows.length;
   const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const dashboardUrl = `${env.SITE_URL}/dashboard?id=${client.id}`;
   const summaryLine = isWeekly
     ? (isEn ? `You reached ${count} Norwegian companies this week. Here is the overview:` : `Du nådde ${count} norske bedrifter denne uken. Her er oversikten:`)
     : (isEn ? `You reached ${count} Norwegian companies today (${today}). Here is the overview:` : `Du nådde ${count} norske bedrifter i dag (${today}). Her er oversikten:`);
@@ -1164,7 +1177,7 @@ async function sendTargetWarningEmail(
   const isEn = client.language === 'en';
   const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   const name = esc(client.sig_name ?? client.company);
-  const dashboardUrl = `${env.SITE_URL}/dashboard?id=${client.id}`;
+  const dashboardUrl = await createDashboardToken(env, client.id);
   const billingDate = client.next_billing_date
     ? new Date(client.next_billing_date + 'T12:00:00Z')
         .toLocaleDateString(isEn ? 'en-GB' : 'nb-NO', { day: 'numeric', month: 'long', year: 'numeric' })
