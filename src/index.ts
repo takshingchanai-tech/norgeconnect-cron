@@ -581,7 +581,7 @@ const API_BASE = 'https://norgeconnect-api.takshingchanai.workers.dev';
 async function createDashboardToken(env: Env, clientId: string): Promise<string> {
   try {
     const token = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
     await env.DB.prepare(
       'INSERT INTO login_tokens (token, client_id, expires_at, used) VALUES (?, ?, ?, 0)'
     ).bind(token, clientId, expiresAt).run();
