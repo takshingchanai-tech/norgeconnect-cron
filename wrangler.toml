@@ -5,13 +5,16 @@ compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]
 binding       = "DB"
-database_name = "norgeconnect-db"
-database_id   = "b73ee3b6-6710-452b-a803-f794833a042f"
+database_name = "norgeconnect-db-eu"
+database_id   = "335123d8-6681-4010-a613-6f8280f021ab"
 
 [vars]
-STRIPE_PRICE_ID    = "price_YOUR_METERED_PRICE_ID"  # from Stripe dashboard
-PAYMENT_LINK_URL   = "https://buy.stripe.com/YOUR_PAYMENT_LINK"
-SYSTEM_FROM_EMAIL  = "hello@norgeconnect.no"
+STRIPE_PRICE_ID      = "price_1TfkvZZB40yxX6SZMhBkQRvX6"
+STRIPE_METER_EVENT   = "norwaycontact_active_day"
+PAYMENT_LINK_MONTHLY     = "https://buy.stripe.com/28E7sKevjewE6sWbs8cEw05"
+PAYMENT_LINK_PRO_MONTHLY = "https://buy.stripe.com/eVqeVc5YN9ckdVodAgcEw07"
+SYSTEM_FROM_EMAIL        = "hello@norwaycontact.com"
+SITE_URL                 = "https://www.norwaycontact.com"
 
 # Secrets — set with: wrangler secret put SECRET_NAME
 # STRIPE_SECRET_KEY
@@ -20,7 +23,19 @@ SYSTEM_FROM_EMAIL  = "hello@norgeconnect.no"
 # GMAIL_CLIENT_SECRET
 # OUTLOOK_CLIENT_ID
 # OUTLOOK_CLIENT_SECRET
+# TOKEN_ENCRYPTION_KEY    ← OAuth token AES-256-GCM decryption (required)
+# CRON_TRIGGER_KEY        ← guards /trigger and /backfill-sender-emails endpoints (required)
 
-# Runs every day at 07:00 UTC (09:00 Oslo / CET)
+# Runs every day at 08:00 UTC (09:00 Oslo winter / 10:00 Oslo summer)
 [triggers]
-crons = ["0 7 * * *"]
+crons = ["0 8 * * *"]
+
+[[queues.producers]]
+queue   = "norgeconnect-email-queue"
+binding = "EMAIL_QUEUE"
+
+[[queues.consumers]]
+queue             = "norgeconnect-email-queue"
+max_batch_size    = 1
+max_batch_timeout = 5
+max_retries       = 2
