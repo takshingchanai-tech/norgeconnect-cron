@@ -84,10 +84,12 @@ interface Target {
   owner_name: string | null;
   email: string;
   industry_name: string | null;
+  brreg_industry: string | null;
   revenue_band: string | null;
   location: string | null;
   homepage: string | null;
   do_not_contact: number;
+  invalid_email: number;
 }
 
 type QueueMsg =
@@ -310,6 +312,7 @@ async function handleDispatch(env: Env, clientId: string, today: string): Promis
       )
       AND   t.email IS NOT NULL
       AND   t.do_not_contact = 0
+      AND   t.invalid_email = 0
       AND   NOT EXISTS (SELECT 1 FROM unsubscribed_emails ue WHERE ue.email = t.email)
       AND   (t.last_contacted IS NULL OR t.last_contacted < ?)
       AND   NOT EXISTS (
@@ -341,6 +344,7 @@ async function handleDispatch(env: Env, clientId: string, today: string): Promis
         )
         AND   t.email IS NOT NULL
         AND   t.do_not_contact = 0
+        AND   t.invalid_email = 0
         AND   NOT EXISTS (SELECT 1 FROM unsubscribed_emails ue WHERE ue.email = t.email)
         AND   (t.last_contacted IS NULL OR t.last_contacted < ?)
         AND   NOT EXISTS (
@@ -431,6 +435,7 @@ async function checkAndSendTargetWarning(env: Env, client: Client, today: string
     )
     AND t.email IS NOT NULL
     AND t.do_not_contact = 0
+    AND t.invalid_email = 0
     AND NOT EXISTS (SELECT 1 FROM unsubscribed_emails ue WHERE ue.email = t.email)
     AND NOT EXISTS (
       SELECT 1 FROM sent_emails s
@@ -447,6 +452,60 @@ async function checkAndSendTargetWarning(env: Env, client: Client, today: string
   await env.DB.prepare("UPDATE clients SET target_warning_sent = ? WHERE id = ?")
     .bind(today, client.id).run();
   console.log(`[dispatch] Target warning sent to ${client.email}: ${freshCount}/${monthlyNeeded} fresh targets remaining`);
+}
+
+// ---------------------------------------------------------------------------
+// Email domain validation — MX lookup via Cloudflare DNS-over-HTTPS
+// ---------------------------------------------------------------------------
+
+type DohResult = 'found' | 'norecord' | 'nxdomain' | 'nullmx' | 'error';
+
+async function dohQuery(domain: string, type: 'MX' | 'A'): Promise<DohResult> {
+  const res = await fetch(
+    `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=${type}`,
+    { headers: { accept: 'application/dns-json' } }
+  );
+  if (!res.ok) return 'error';
+  const data = await res.json<{ Status: number; Answer?: Array<{ type: number; data: string }> }>();
+  if (data.Status === 3) return 'nxdomain';
+  if (data.Status !== 0) return 'error';  // SERVFAIL etc. — not a definitive answer
+  const wantType = type === 'MX' ? 15 : 1;
+  const records = (data.Answer ?? []).filter(a => a.type === wantType);
+  if (records.length === 0) return 'norecord';
+  // Null MX (RFC 7505, "0 .") — domain explicitly declares it accepts no mail
+  if (type === 'MX' && records.every(r => r.data.trim() === '0 .')) return 'nullmx';
+  return 'found';
+}
+
+/**
+ * 'invalid' only on a definitive DNS answer (NXDOMAIN, null MX, or no MX and
+ * no A record). DoH/network errors return 'unknown' so a DNS-service outage
+ * never blocks sending or falsely flags targets.
+ */
+async function checkEmailDomain(email: string): Promise<'valid' | 'invalid' | 'unknown'> {
+  const at = email.lastIndexOf('@');
+  if (at <= 0 || at === email.length - 1) return 'invalid';
+  let domain = email.slice(at + 1).trim().toLowerCase();
+  // Norwegian IDN domains (æøå) must be queried in punycode; URL converts them
+  try {
+    domain = new URL(`http://${domain}`).hostname;
+  } catch {
+    return 'invalid';  // not even parseable as a hostname
+  }
+
+  try {
+    const mx = await dohQuery(domain, 'MX');
+    if (mx === 'found') return 'valid';
+    if (mx === 'error') return 'unknown';
+    if (mx === 'nxdomain' || mx === 'nullmx') return 'invalid';
+    // Domain exists but has no MX — RFC 5321 implicit MX falls back to the A record
+    const a = await dohQuery(domain, 'A');
+    if (a === 'found') return 'valid';
+    if (a === 'error') return 'unknown';
+    return 'invalid';
+  } catch {
+    return 'unknown';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -478,12 +537,24 @@ async function handleSendEmail(
     console.log(`[email] Target ${targetOrgNumber} opted out since dispatch, skipping`);
     return;
   }
+  if (target.invalid_email) {
+    console.log(`[email] Target ${targetOrgNumber} flagged invalid_email since dispatch, skipping`);
+    return;
+  }
 
   const emailBlocked = await env.DB.prepare(
     'SELECT 1 FROM unsubscribed_emails WHERE email = ?'
   ).bind(target.email).first();
   if (emailBlocked) {
     console.log(`[email] Target email ${target.email} is globally unsubscribed, skipping`);
+    return;
+  }
+
+  const domainCheck = await checkEmailDomain(target.email);
+  if (domainCheck === 'invalid') {
+    await env.DB.prepare('UPDATE targets SET invalid_email = 1 WHERE org_number = ?')
+      .bind(target.org_number).run();
+    console.log(`[email] Target ${targetOrgNumber}: dead email domain (${target.email}) — flagged invalid_email, skipping`);
     return;
   }
 
@@ -583,7 +654,7 @@ async function createDashboardToken(env: Env, clientId: string): Promise<string>
     const token = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
     await env.DB.prepare(
-      'INSERT INTO login_tokens (token, client_id, expires_at, used) VALUES (?, ?, ?, 0)'
+      'INSERT INTO login_tokens (token, client_id, expires_at, used, multi_use) VALUES (?, ?, ?, 0, 1)'
     ).bind(token, clientId, expiresAt).run();
     return `${API_BASE}/api/login/verify?token=${token}`;
   } catch {
@@ -629,13 +700,17 @@ function buildEmailBody(client: Client, target: Target, unsubToken: string): str
 
   const unsubUrl = `${API_BASE}/api/unsubscribe?org=${target.org_number}&token=${unsubToken}`;
 
-  const introHtml = (client.use_intro !== 0 && target.industry_name)
-    ? `<p>Vi jobber med selskaper innen ${esc(target.industry_name)} og tok kontakt fordi vi tror vårt tilbud kan være relevant for <strong>${esc(target.company_name)}</strong>.</p>`
+  const introIndustry = (target.brreg_industry && target.brreg_industry.length <= 60)
+    ? target.brreg_industry.toLowerCase()
+    : (target.industry_name ?? '').toLowerCase();
+  const introHtml = (client.use_intro !== 0 && introIndustry)
+    ? `<p>Vi jobber med selskaper innen ${esc(introIndustry)} og tok kontakt fordi vi tror vårt tilbud kan være relevant for <strong>${esc(target.company_name)}</strong>.</p>`
     : '';
 
   return `<!DOCTYPE html>
 <html>
-<body style="font-family:Arial,sans-serif;font-size:14px;color:#333;line-height:1.7;max-width:600px;margin:0;padding:20px;">
+<body>
+<div style="font-family:Arial,sans-serif;font-size:14px;color:#333;line-height:1.7;max-width:600px;margin:0;padding:20px;">
 <p>${greeting}</p>
 ${introHtml}<p>${esc(client.pitch_template)}</p>
 <br>
@@ -645,6 +720,7 @@ ${logoHtml}
 <br>
 <hr style="border:none;border-top:1px solid #ddd;margin:16px 0;">
 <p style="font-size:12px;color:#666;">Ønsker du ikke å motta slike henvendelser? <a href="${unsubUrl}" style="color:#444;text-decoration:underline;">Klikk her for å melde deg av</a> &nbsp;·&nbsp; <a href="https://www.norwaycontact.com/privacy" style="color:#444;text-decoration:underline;">Personvern</a></p>
+</div>
 </body>
 </html>`;
 }
@@ -886,38 +962,24 @@ async function sendPaymentReminder(
   // ── Copy ─────────────────────────────────────────────────────────────────
   const greeting  = isEn ? `Hi ${name},` : `Hei ${name},`;
   const bodyLine1 = when === 'tomorrow'
-    ? (isEn ? 'Your free trial expires <strong>tomorrow</strong>. Choose a plan below to continue without interruption.'         : 'Prøveperioden din utløper <strong>i morgen</strong>. Velg et abonnement nedenfor for å fortsette uten avbrudd.')
+    ? (isEn ? 'Your free trial expires after <strong>tomorrow\'s</strong> emails are sent — you have one sending day left.'      : 'Prøveperioden din utløper etter <strong>morgendagens</strong> utsendelse — du har én utsendelsesdag igjen.')
     : (isEn ? 'Your trial has ended. Email sending has been <strong>temporarily paused</strong>.'                                : 'Prøveperioden din er over. E-postutsendelsen er <strong>midlertidig satt på pause</strong>.');
   const bodyLine2 = when === 'tomorrow'
-    ? (isEn ? 'It takes under 2 minutes — card payment via Stripe. Start sending the next morning.'                              : 'Det tar under 2 minutter — kortbetaling via Stripe. Utsendelsene starter neste morgen.')
+    ? (isEn ? 'Check your results so far in the dashboard.'                                                                      : 'Se over resultatene dine i dashboardet.')
     : (isEn ? 'All your settings, templates, and data are preserved. Choose a plan to resume.'                                   : 'Alle innstillinger, maler og data er beholdt. Velg et abonnement for å fortsette.');
+  const dashBtnLabel = isEn ? 'Go to dashboard →' : 'Gå til dashboard →';
   const stdLabel    = isEn ? 'Standard — 20 emails/day'       : 'Standard — 20 henvendelser/dag';
   const proLabel    = isEn ? 'Pro — 50 emails/day'            : 'Pro — 50 henvendelser/dag';
   const proSubline  = isEn ? '2.5× more reach per day'        : '2,5× mer rekkevidde per dag';
   const cancelNote  = isEn ? 'Auto-renews — cancel before next renewal.' : 'Fornyes automatisk — avslutt før neste fornyelse.';
   const helpLine    = isEn
-    ? `Questions? Reply to this email or write to <a href="mailto:hello@norwaycontact.com" style="color:#1B3A6B;">hello@norwaycontact.com</a> · <a href="${dashboardUrl}" style="color:#1B3A6B;">Go to dashboard →</a>`
-    : `Spørsmål? Svar på denne e-posten eller skriv til <a href="mailto:hello@norwaycontact.com" style="color:#1B3A6B;">hello@norwaycontact.com</a> · <a href="${dashboardUrl}" style="color:#1B3A6B;">Gå til dashboard →</a>`;
+    ? `Questions? Reply to this email or write to <a href="mailto:hello@norwaycontact.com" style="color:#1B3A6B;">hello@norwaycontact.com</a>`
+    : `Spørsmål? Svar på denne e-posten eller skriv til <a href="mailto:hello@norwaycontact.com" style="color:#1B3A6B;">hello@norwaycontact.com</a>`;
   const footerNote  = isEn
     ? 'NorwayContact · hello@norwaycontact.com<br>You are receiving this because you signed up at norwaycontact.com.'
     : 'NorwayContact · hello@norwaycontact.com<br>Du mottar denne e-posten fordi du registrerte deg på norwaycontact.com.';
 
-  // ── HTML ──────────────────────────────────────────────────────────────────
-  const html = `<!DOCTYPE html>
-<html lang="${isEn ? 'en' : 'no'}">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#FAFAF8;font-family:sans-serif;color:#111;">
-<div style="max-width:580px;margin:40px auto;background:white;border:1px solid #E2E2DC;border-radius:12px;overflow:hidden;">
-
-  <div style="background:#1B3A6B;padding:28px 32px;">
-    <span style="color:white;font-size:1.125rem;font-weight:700;letter-spacing:-0.02em;">NorwayContact</span>
-  </div>
-
-  <div style="padding:36px 32px 28px;">
-    <p style="margin:0 0 4px;font-size:1rem;color:#111;">${greeting}</p>
-    <p style="margin:0 0 6px;font-size:0.9375rem;color:#374151;line-height:1.7;">${bodyLine1}</p>
-    <p style="margin:0 0 28px;font-size:0.875rem;color:#6B7280;line-height:1.7;">${bodyLine2}</p>
-
+  const plansHtml = when === 'expired' ? `
     <!-- Standard plan -->
     <div style="border:1px solid #E2E2DC;border-radius:10px;padding:20px 24px;margin-bottom:14px;">
       <p style="margin:0 0 14px;font-weight:700;color:#111;font-size:0.9375rem;">${stdLabel}</p>
@@ -936,6 +998,29 @@ async function sendPaymentReminder(
     </div>
 
     <p style="margin:0 0 20px;font-size:0.875rem;color:#6B7280;">${cancelNote}</p>
+` : '';
+
+  // ── HTML ──────────────────────────────────────────────────────────────────
+  const html = `<!DOCTYPE html>
+<html lang="${isEn ? 'en' : 'no'}">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#FAFAF8;font-family:sans-serif;color:#111;">
+<div style="max-width:580px;margin:40px auto;background:white;border:1px solid #E2E2DC;border-radius:12px;overflow:hidden;">
+
+  <div style="background:#1B3A6B;padding:28px 32px;">
+    <span style="color:white;font-size:1.125rem;font-weight:700;letter-spacing:-0.02em;">NorwayContact</span>
+  </div>
+
+  <div style="padding:36px 32px 28px;">
+    <p style="margin:0 0 4px;font-size:1rem;color:#111;">${greeting}</p>
+    <p style="margin:0 0 6px;font-size:0.9375rem;color:#374151;line-height:1.7;">${bodyLine1}</p>
+    <p style="margin:0 0 28px;font-size:0.875rem;color:#6B7280;line-height:1.7;">${bodyLine2}</p>
+
+    ${plansHtml}
+
+    <a href="${dashboardUrl}" style="display:inline-block;padding:11px 22px;background:white;color:#1B3A6B;border:1.5px solid #1B3A6B;border-radius:8px;font-weight:600;font-size:0.9rem;text-decoration:none;margin-bottom:28px;">
+      ${dashBtnLabel}
+    </a>
 
     <hr style="border:none;border-top:1px solid #E2E2DC;margin:0 0 16px;">
     <p style="margin:0;font-size:0.8125rem;color:#9CA3AF;line-height:1.7;">${helpLine}</p>
@@ -950,23 +1035,30 @@ async function sendPaymentReminder(
 </html>`;
 
   // ── Plain text fallback ───────────────────────────────────────────────────
-  const text = [
+  const textLines: string[] = [
     greeting,
     '',
     when === 'tomorrow'
-      ? (isEn ? 'Your free trial expires tomorrow.' : 'Prøveperioden din utløper i morgen.')
+      ? (isEn ? "Your free trial expires after tomorrow's emails are sent — you have one sending day left." : 'Prøveperioden din utløper etter morgendagens utsendelse — du har én utsendelsesdag igjen.')
       : (isEn ? 'Your trial has ended. Email sending has been temporarily paused.' : 'Prøveperioden din er over. E-postutsendelsen er midlertidig satt på pause.'),
     '',
-    isEn ? 'Standard — 20 emails/day:' : 'Standard — 20 henvendelser/dag:',
-    `  1700 NOK/${isEn ? 'month' : 'mnd'}  → ${env.PAYMENT_LINK_MONTHLY}?prefilled_email=${encodeURIComponent(client.email)}`,
+    `${isEn ? 'Go to dashboard' : 'Gå til dashboard'}: ${dashboardUrl}`,
     '',
-    isEn ? 'Pro — 50 emails/day:' : 'Pro — 50 henvendelser/dag:',
-    `  3400 NOK/${isEn ? 'month' : 'mnd'}  → ${env.PAYMENT_LINK_PRO_MONTHLY}?prefilled_email=${encodeURIComponent(client.email)}`,
-    '',
-    cancelNote,
-    '',
-    '— NorwayContact',
-  ].join('\n');
+  ];
+  if (when === 'expired') {
+    textLines.push(
+      isEn ? 'Standard — 20 emails/day:' : 'Standard — 20 henvendelser/dag:',
+      `  1700 NOK/${isEn ? 'month' : 'mnd'}  → ${env.PAYMENT_LINK_MONTHLY}?prefilled_email=${encodeURIComponent(client.email)}`,
+      '',
+      isEn ? 'Pro — 50 emails/day:' : 'Pro — 50 henvendelser/dag:',
+      `  3400 NOK/${isEn ? 'month' : 'mnd'}  → ${env.PAYMENT_LINK_PRO_MONTHLY}?prefilled_email=${encodeURIComponent(client.email)}`,
+      '',
+      cancelNote,
+      '',
+    );
+  }
+  textLines.push('— NorwayContact');
+  const text = textLines.join('\n');
 
   await sendResendEmail(env, client.email, subject, text, html);
 }
@@ -985,7 +1077,7 @@ async function sendReportForClient(env: Env, client: Client, today: string): Pro
 
   const { results: rows } = await env.DB.prepare(`
     SELECT s.target_company, s.target_owner, s.target_location, s.target_email,
-           t.homepage AS target_homepage, t.industry_name AS target_industry
+           t.homepage AS target_homepage, t.industry_name AS target_industry, t.brreg_industry AS target_brreg_industry
     FROM sent_emails s
     LEFT JOIN targets t ON t.org_number = s.target_org_number
     WHERE s.client_id = ? AND DATE(s.sent_at) >= ? AND s.status = 'sent'
@@ -997,6 +1089,7 @@ async function sendReportForClient(env: Env, client: Client, today: string): Pro
     target_email: string;
     target_homepage: string | null;
     target_industry: string | null;
+    target_brreg_industry: string | null;
   }>();
 
   if (rows.length === 0) return;
@@ -1040,7 +1133,7 @@ function shouldSendReport(client: Client, today: string, isWeekly: boolean): boo
 
 function buildReportHtml(
   client: Client,
-  rows: Array<{ target_company: string; target_owner: string | null; target_location: string | null; target_email: string; target_homepage: string | null; target_industry: string | null }>,
+  rows: Array<{ target_company: string; target_owner: string | null; target_location: string | null; target_email: string; target_homepage: string | null; target_industry: string | null; target_brreg_industry: string | null }>,
   isWeekly: boolean,
   today: string,
   dashboardUrl: string
@@ -1106,7 +1199,7 @@ function buildReportHtml(
       const ownerFirst = sample.target_owner?.split(' ')[0];
       const greeting = ownerFirst ? `Hei ${esc(ownerFirst)},` : 'Hei,';
       const introHtml = (client.use_intro !== 0 && sample.target_industry)
-        ? `<p style="margin:0 0 12px;">Vi jobber med selskaper innen ${esc(sample.target_industry)} og tok kontakt fordi vi tror vårt tilbud kan være relevant for <strong>${esc(sample.target_company)}</strong>.</p>`
+        ? `<p style="margin:0 0 12px;">Vi jobber med selskaper innen ${esc((sample.target_brreg_industry && sample.target_brreg_industry.length <= 60 ? sample.target_brreg_industry : sample.target_industry ?? '').toLowerCase())} og tok kontakt fordi vi tror vårt tilbud kan være relevant for <strong>${esc(sample.target_company)}</strong>.</p>`
         : '';
       const sampleHeading = isEn ? 'Example email sent today' : 'Eksempel på e-post sendt i dag';
       const sampleSubline = isEn
