@@ -670,6 +670,20 @@ function parseLogos(raw: string | null): string[] {
   return [raw];
 }
 
+// Turn http(s):// and bare www. URLs in already-HTML-escaped text into clickable links.
+// MUST run AFTER HTML-escaping so its input is safe. Trailing sentence punctuation
+// (e.g. the comma in "...norwaycontact.com ,") is kept outside the <a>.
+function linkify(escaped: string): string {
+  const wrap = (match: string, hrefPrefix: string) => {
+    const trail = match.match(/[.,;:!?)]+$/)?.[0] ?? '';
+    const clean = match.slice(0, match.length - trail.length);
+    return `<a href="${hrefPrefix}${clean}" style="color:#1B3A6B;text-decoration:underline;">${clean}</a>${trail}`;
+  };
+  return escaped
+    .replace(/\bhttps?:\/\/[^\s<]+/g, (m) => wrap(m, ''))
+    .replace(/(^|[\s(>])(www\.[^\s<]+)/g, (_full, pre, m) => `${pre}${wrap(m, 'https://')}`);
+}
+
 function buildEmailBody(client: Client, target: Target, unsubToken: string): string {
   const esc = (s: string) => s
     .replace(/&/g, '&amp;')
@@ -681,12 +695,12 @@ function buildEmailBody(client: Client, target: Target, unsubToken: string): str
   const greeting = ownerFirst ? `Hei ${esc(ownerFirst)},` : 'Hei,';
 
   // sig_info may be stored with literal \n sequences — normalise before splitting
-  const sigLines = (client.sig_info ?? '')
+  const sigLines = linkify((client.sig_info ?? '')
     .replace(/\\n/g, '\n')
     .split('\n')
     .filter(Boolean)
     .map(esc)
-    .join('<br>');
+    .join('<br>'));
 
   const sigBlock = [
     client.sig_name ? `<strong>${esc(client.sig_name)}</strong>` : '',
@@ -712,7 +726,7 @@ function buildEmailBody(client: Client, target: Target, unsubToken: string): str
 <body>
 <div style="font-family:Arial,sans-serif;font-size:14px;color:#333;line-height:1.7;max-width:600px;margin:0;padding:20px;">
 <p>${greeting}</p>
-${introHtml}<p>${esc(client.pitch_template)}</p>
+${introHtml}<p>${linkify(esc(client.pitch_template))}</p>
 <br>
 <p style="margin-bottom:6px;">Med vennlig hilsen,</p>
 ${logoHtml}
@@ -1205,8 +1219,8 @@ function buildReportHtml(
       const sampleSubline = isEn
         ? `This is how the email looked to the recipient at <strong style="color:#111;">${esc(sample.target_company)}</strong>:`
         : `Slik så e-posten ut for mottakeren hos <strong style="color:#111;">${esc(sample.target_company)}</strong>:`;
-      const pitchHtml = esc(client.pitch_template).replace(/\n/g, '<br>');
-      const sigLines = (client.sig_info ?? '').replace(/\\n/g, '\n').split('\n').filter(Boolean).map(esc).join('<br>');
+      const pitchHtml = linkify(esc(client.pitch_template).replace(/\n/g, '<br>'));
+      const sigLines = linkify((client.sig_info ?? '').replace(/\\n/g, '\n').split('\n').filter(Boolean).map(esc).join('<br>'));
       const sigBlock = [
         client.sig_name ? `<strong>${esc(client.sig_name)}</strong>` : '',
         client.company  ? esc(client.company)  : '',
