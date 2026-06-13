@@ -597,7 +597,7 @@ async function handleSendEmail(
 async function runTrialManagement(env: Env, today: string): Promise<void> {
   const tomorrow = toISODate(addDays(new Date(), 1));
 
-  // Day-6 reminder: trial ends tomorrow, send payment link
+  // Day-7 reminder: trial ends tomorrow, send payment link
   const { results: expiringTomorrow } = await env.DB.prepare(`
     SELECT * FROM clients
     WHERE status = 'trial'
