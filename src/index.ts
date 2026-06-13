@@ -597,7 +597,7 @@ async function handleSendEmail(
 async function runTrialManagement(env: Env, today: string): Promise<void> {
   const tomorrow = toISODate(addDays(new Date(), 1));
 
-  // Day-7 reminder: trial ends tomorrow, send payment link
+  // Day-6 warning: trial ends tomorrow — sends "expires tomorrow" email (no payment links yet)
   const { results: expiringTomorrow } = await env.DB.prepare(`
     SELECT * FROM clients
     WHERE status = 'trial'
@@ -628,7 +628,7 @@ async function runTrialManagement(env: Env, today: string): Promise<void> {
     console.log(`[cron] Paused client ${client.email} (no payment after 3 days)`);
   }
 
-  // Trial expired today — move to 'awaiting' and send urgent reminder
+  // Day-7: trial expired today — move to 'awaiting' and send payment links email
   const { results: expiredToday } = await env.DB.prepare(`
     SELECT * FROM clients
     WHERE status = 'trial'
